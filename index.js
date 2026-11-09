@@ -1,31 +1,28 @@
 'use strict';
 /**
  * wa-html-kit — send HTML through WhatsApp (Baileys).
- *
- * WhatsApp does not officially render HTML inside a chat bubble, so this
- * package ships the three routes that actually work, in one API:
- *
- *  1. DOCUMENT  — sendHtmlDocument(): the .html file as a document.
- *                 Guaranteed on every client; the user opens it in a
- *                 browser and everything (CSS/JS/games) runs.
- *  2. NATIVE    — sendNativeHtml(): packs the HTML into WhatsApp's
- *                 observed rich-response (GenAI HTML primitive) payload
- *                 via relayMessage. Renders in-chat on clients that
- *                 support the primitive — no guarantee on every client.
- *  3. FALLBACK  — sendHtml(): native first, document on failure, so the
- *                 user always receives something usable.
- *
- * Extras: {{PFP}} profile-picture injection, a single-file page builder,
- * and the 60 KB native-payload size guard.
+ * v1.1.0: hardened PFP, classified fallback, safe metadata cloning,
+ * inspectHtml diagnostics, async file handling.
+ * WARNING: Native HTML rendering is experimental / observed behaviour,
+ * not an official WhatsApp guarantee on every client.
  */
-
-const fs = require('node:fs');
+const fsPromises = require('node:fs/promises');
 const crypto = require('node:crypto');
+const errors = require('./lib/errors');
+const {
+  WaHtmlError, PfpDownloadError, PfpTimeoutError, PfpTooLargeError, PfpMimeError,
+  PfpValidationError, HtmlFileError, NativeHtmlError, NativePayloadTooLargeError,
+  NativeRelayUnavailableError, NativeUnsupportedPayloadError,
+  MetadataValidationError, HtmlValidationError,
+} = errors;
+const { cloneMetadata } = require('./lib/metadata');
+const { inspectHtml } = require('./lib/html-inspector');
+const { NativeErrorCategory, classifyNativeError, FALLBACK_CATEGORIES } = require('./lib/fallback');
+const { DEFAULT_PFP_OPTIONS, validatePfpDataUri, validateTrustedSources, downloadPfpDataUri, getPfpDataUri, injectPfp } = require('./lib/pfp');
 
 const HTML_PRIMITIVE = 'GenAIaeacdsnwHtmlPrimitive';
 const MAX_NATIVE_BYTES = 60 * 1024;
-
-const clone = (v) => JSON.parse(JSON.stringify(v ?? {}));
+const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 function htmlBytes(html) {
   if (typeof html !== 'string' || !html.trim()) throw new TypeError('wa-html-kit: HTML must be a non-empty string');
@@ -35,15 +32,20 @@ function htmlBytes(html) {
 function assertNativeSize(html) {
   const bytes = htmlBytes(html);
   if (bytes > MAX_NATIVE_BYTES) {
-    throw new Error(`wa-html-kit: HTML is ${bytes} bytes — the native rich payload limit is ${MAX_NATIVE_BYTES}. Use sendHtmlDocument() or shrink the page.`);
+    throw new NativePayloadTooLargeError(`wa-html-kit: HTML is ${bytes} bytes — the native rich payload limit is ${MAX_NATIVE_BYTES}. Use sendHtmlDocument() or shrink the page.`);
   }
   return bytes;
 }
 
-// ─── 1. document route (guaranteed) ───
+function validateJid(jid) {
+  if (!jid) throw new HtmlValidationError('wa-html-kit: jid is required', { code: 'INVALID_JID' });
+  if (typeof jid !== 'string' || !jid.includes('@')) throw new HtmlValidationError('wa-html-kit: jid must be a valid WhatsApp JID containing @', { code: 'INVALID_JID' });
+}
+
+// ─── document route ───
 async function sendHtmlDocument(sock, jid, html, opts = {}) {
   if (!sock || typeof sock.sendMessage !== 'function') throw new Error('wa-html-kit: sock.sendMessage is required');
-  if (!jid) throw new Error('wa-html-kit: jid is required');
+  validateJid(jid);
   htmlBytes(html);
   return sock.sendMessage(jid, {
     document: Buffer.from(html, 'utf8'),
@@ -54,18 +56,47 @@ async function sendHtmlDocument(sock, jid, html, opts = {}) {
 }
 
 async function sendHtmlFile(sock, jid, filePath, opts = {}) {
-  const html = fs.readFileSync(filePath, 'utf8');
+  if (!sock || typeof sock.sendMessage !== 'function') throw new Error('wa-html-kit: sock.sendMessage is required');
+  validateJid(jid);
+  const maxFileBytes = opts.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+  let stat;
+  try {
+    stat = await fsPromises.stat(filePath);
+  } catch (e) {
+    throw new HtmlFileError(`wa-html-kit: failed to read HTML file: ${filePath}`, { cause: e });
+  }
+  if (!stat.isFile()) throw new HtmlFileError(`wa-html-kit: failed to read HTML file: ${filePath} is not a file`);
+  if (stat.size > maxFileBytes) {
+    throw new HtmlFileError(`wa-html-kit: HTML file is ${stat.size} bytes, exceeding limit of ${maxFileBytes} bytes`, { code: 'HTML_FILE_TOO_LARGE' });
+  }
+  let html;
+  try {
+    html = await fsPromises.readFile(filePath, 'utf8');
+  } catch (e) {
+    throw new HtmlFileError(`wa-html-kit: failed to read HTML file: ${filePath}`, { cause: e });
+  }
+  const bytes = Buffer.byteLength(html, 'utf8');
+  if (bytes > maxFileBytes) {
+    throw new HtmlFileError(`wa-html-kit: HTML file is ${bytes} bytes, exceeding limit of ${maxFileBytes} bytes`, { code: 'HTML_FILE_TOO_LARGE' });
+  }
   return sendHtmlDocument(sock, jid, html, opts);
 }
 
-// ─── 2. native rich-response route ───
-// opts.meta: { messageContextInfo, contextInfo } captured from a working
-// rich response on your own setup — injected, never hardcoded here.
+// ─── native route ───
 function buildNativeHtmlPayload(html, opts = {}) {
   assertNativeSize(html);
   const meta = opts.meta || {};
+  const messageContextInfo = cloneMetadata(meta.messageContextInfo ?? {});
+  const contextInfo = cloneMetadata(meta.contextInfo ?? {});
+  const primitive = {
+    __typename: HTML_PRIMITIVE,
+    payload: html,
+  };
+  if (opts.trustedSources !== undefined) {
+    primitive.trusted_sources = validateTrustedSources(opts.trustedSources);
+  }
   return {
-    messageContextInfo: clone(meta.messageContextInfo),
+    messageContextInfo,
     botForwardedMessage: {
       message: {
         richResponseMessage: {
@@ -76,17 +107,13 @@ function buildNativeHtmlPayload(html, opts = {}) {
               response_id: crypto.randomUUID(),
               sections: [{
                 view_model: {
-                  primitive: {
-                    __typename: HTML_PRIMITIVE,
-                    payload: html,
-                    trusted_sources: opts.trustedSources || ['nixel.dev'],
-                  },
+                  primitive,
                   __typename: 'GenAISingleLayoutViewModel',
                 },
               }],
             }), 'utf8').toString('base64'),
           },
-          contextInfo: clone(meta.contextInfo),
+          contextInfo,
         },
       },
     },
@@ -94,52 +121,71 @@ function buildNativeHtmlPayload(html, opts = {}) {
 }
 
 async function sendNativeHtml(sock, jid, html, opts = {}) {
-  if (!sock || typeof sock.relayMessage !== 'function') throw new Error('wa-html-kit: sock.relayMessage is required');
-  if (!jid) throw new Error('wa-html-kit: jid is required');
+  if (!sock || typeof sock.relayMessage !== 'function') throw new NativeRelayUnavailableError('wa-html-kit: sock.relayMessage is required');
+  validateJid(jid);
   const payload = buildNativeHtmlPayload(html, opts);
   return sock.relayMessage(jid, payload, opts.quoted ? { quoted: opts.quoted } : {});
 }
 
-// ─── 3. native with document fallback ───
+// ─── fallback route ───
+async function doFallback(sock, jid, html, opts, category, error) {
+  if (typeof opts.onFallback === 'function') {
+    try {
+      const r = opts.onFallback({ category, error, route: 'document' });
+      if (r && typeof r.then === 'function') await r;
+    } catch {}
+  }
+  return sendHtmlDocument(sock, jid, html, opts);
+}
+
 async function sendHtml(sock, jid, html, opts = {}) {
+  // validation first — throws, never falls back
+  htmlBytes(html);
+  validateJid(jid);
+
+  if (opts.fallback === false) {
+    return sendNativeHtml(sock, jid, html, opts);
+  }
+
+  // pre-check size
+  let bytes;
+  try { bytes = htmlBytes(html); } catch (e) { throw e; }
+  if (bytes > MAX_NATIVE_BYTES) {
+    let err;
+    try { assertNativeSize(html); } catch (e) { err = e; }
+    return doFallback(sock, jid, html, opts, NativeErrorCategory.PAYLOAD_TOO_LARGE, err);
+  }
+
+  // pre-check relay availability
+  if (!sock || typeof sock.relayMessage !== 'function') {
+    const err = new NativeRelayUnavailableError('wa-html-kit: sock.relayMessage is required');
+    return doFallback(sock, jid, html, opts, NativeErrorCategory.RELAY_UNAVAILABLE, err);
+  }
+
   try {
-    if (Buffer.byteLength(html, 'utf8') > MAX_NATIVE_BYTES) throw new Error('too large for native');
     return await sendNativeHtml(sock, jid, html, opts);
-  } catch {
-    return sendHtmlDocument(sock, jid, html, opts);
+  } catch (err) {
+    const category = classifyNativeError(err);
+    if (FALLBACK_CATEGORIES.has(category)) {
+      return doFallback(sock, jid, html, opts, category, err);
+    }
+    if (category === NativeErrorCategory.UNKNOWN) {
+      if (opts.fallbackOnUnknownError !== false) {
+        return doFallback(sock, jid, html, opts, category, err);
+      }
+      throw err;
+    }
+    throw err;
   }
 }
 
-// ─── PFP personalisation ───
-// Replaces every {{PFP}} placeholder in the HTML with a data-URI of the
-// chat's profile picture (empty string when no picture is available).
-function injectPfp(html, dataUri) {
-  return String(html).split('{{PFP}}').join(dataUri || '');
-}
-
-async function getPfpDataUri(sock, jid) {
-  try {
-    if (!jid || typeof sock?.profilePictureUrl !== 'function') return '';
-    const url = await sock.profilePictureUrl(jid, 'image');
-    if (!url || typeof fetch !== 'function') return '';
-    const res = await fetch(url);
-    if (!res.ok) return '';
-    const contentType = res.headers.get('content-type') || 'image/jpeg';
-    if (!/^image\//i.test(contentType)) return '';
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (!buf.length || buf.length > 2 * 1024 * 1024) return '';
-    return `data:${contentType};base64,${buf.toString('base64')}`;
-  } catch {
-    return '';
-  }
-}
-
-async function personalizeHtml(sock, jid, html) {
+// ─── PFP ───
+async function personalizeHtml(sock, jid, html, opts = {}) {
   if (!String(html).includes('{{PFP}}')) return html;
-  return injectPfp(html, await getPfpDataUri(sock, jid));
+  return injectPfp(html, await getPfpDataUri(sock, jid, opts));
 }
 
-// ─── single-file page builder ───
+// ─── page builder ───
 const escapeHtml = (s) => String(s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -178,4 +224,26 @@ module.exports = {
   personalizeHtml,
   escapeHtml,
   htmlPage,
+  // new v1.1
+  downloadPfpDataUri,
+  validatePfpDataUri,
+  inspectHtml,
+  cloneMetadata,
+  classifyNativeError,
+  validateTrustedSources,
+  NativeErrorCategory,
+  DEFAULT_PFP_OPTIONS,
+  WaHtmlError,
+  PfpDownloadError,
+  PfpTimeoutError,
+  PfpTooLargeError,
+  PfpMimeError,
+  PfpValidationError,
+  HtmlFileError,
+  NativeHtmlError,
+  NativePayloadTooLargeError,
+  NativeRelayUnavailableError,
+  NativeUnsupportedPayloadError,
+  MetadataValidationError,
+  HtmlValidationError,
 };
